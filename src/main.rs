@@ -1,6 +1,9 @@
 extern crate clap;
 extern crate md5;
 
+#[macro_use]
+extern crate nom;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::io;
@@ -9,7 +12,9 @@ use std::process;
 
 use clap::{Arg, App};
 
-const HELP: &'static str = 
+use nom::{is_hex_digit, rest};
+
+const HELP: &'static str =
 r#"Usage: md5sum [OPTION]... [FILE]...
 Print or check MD5 (128-bit) checksums.
 
@@ -37,7 +42,7 @@ fn app() -> App<'static, 'static> {
         .author("Jean-Marie C. <jean.marie.comets@gmail.com>")
         .about("Print or check MD5 (128-bit) checksums.")
         .help(HELP)
-        .arg(Arg::with_name("FILE")
+        .arg(Arg::with_name("file")
              .multiple(true)
              .takes_value(true))
         .arg(Arg::with_name("check")
@@ -67,53 +72,184 @@ const STDIN_NAME: &'static str = "-";
 fn main() {
     let matches = app().get_matches();
 
-    let filenames = matches.values_of("FILE")
+    let filenames = matches.values_of("file")
         .map(Vec::from_iter)
         .unwrap_or(vec![STDIN_NAME]);
 
-    let stdin = io::stdin();
+    // flags
+    let check = matches.is_present("check");
+    let ignore_missing = matches.is_present("ignore_missing");
+    let quiet = matches.is_present("quiet");
+    let status = matches.is_present("status");
+    let strict = matches.is_present("strict");
+    let warn = matches.is_present("warn");
 
-    for filename in filenames {
-        let mut reader = {
-            macro_rules! boxed_bufread {
-                ($e:expr) => {
-                    Box::new($e) as Box<BufRead>
+    macro_rules! print_err {
+        ($fmt:tt$(, $arg:expr)*) => {
+            if !quiet {
+                eprintln!($fmt, $( $arg, )*);
+            }
+        }
+    }
+
+    macro_rules! exit_err {
+        ($fmt:tt$(, $arg:expr)*) => {
+            eprintln!($fmt, $( $arg, )*);
+            process::exit(1);
+        }
+    }
+
+    if check {
+        let mut failed = vec![];
+        for filename in filenames {
+            read(filename, |r| {
+                for line in r.lines() {
+                    use MD5Check::*;
+
+                    let md5check = line
+                        .map(|line| md5sum_check(&line))
+                        .unwrap_or_else(|e| ReadError(filename.to_string(), e));
+
+                    match md5check {
+                        MatchSuccess => {
+                            println!("{}: OK", filename);
+                        }
+                        MatchFailed(filename) => {
+                            if !status {
+                                print_err!("{}: FAILED", filename);
+                            }
+
+                            failed.push(filename.to_string());
+                        }
+                        BadFormat => {
+                            if strict {
+                                exit_err!("ERROR: line badly formatted");
+                            } else if warn {
+                                print_err!("WARNING: line badly formatted");
+                            }
+                        }
+                        ReadError(filename, _) => {
+                            if ignore_missing {
+                                exit_err!("FAILED: coult not read {}", filename);
+                            }
+                        }
+                    }
                 }
-            }
 
-            if filename == STDIN_NAME {
-                boxed_bufread!(stdin.lock())
-            } else {
-                let file = File::open(&filename)
-                    .map(BufReader::new)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to open {}: {:?}", &filename, e);
-                        process::exit(1);
-                    });
-                boxed_bufread!(file)
-            }
-        };
+                Ok(())
+            }).unwrap_or_else(|_| {
+                if ignore_missing {
+                    exit_err!("FAILED: coult not read {}", filename);
+                }
+            });
+        }
 
-        let sum = md5sum(&mut reader);
+        //println!("md5sum: src/main.rs: no properly formatted MD5 checksum lines found");
 
-        println!("{:x}  {}", sum, filename);
+        if failed.len() > 0 {
+            let suffix = if failed.len() > 1 { "s" } else { "" };
+            print_err!("md5sum: WARNING: {} computed checksum{} did NOT match", failed.len(), suffix);
+            process::exit(1);
+        }
+    } else {
+        for filename in filenames {
+            let sum = read_md5sum(filename)
+                .unwrap_or_else(|e| {
+                    print_err!("Error when reading \"{}\": {:?}", filename, e);
+                    process::exit(1);
+                });
+
+            println!("{:x}  {}", sum, filename);
+        }
     }
 }
 
-fn md5sum<R: BufRead>(mut reader: R) -> md5::Digest {
+fn is_hex_str(hs: &str) -> bool {
+    hs.bytes().all(|h| is_hex_digit(h))
+}
+
+named!(md5sum_output<&str>, verify!(take_str!(32), is_hex_str));
+
+named!(md5sum_line<(&str, &str)>, do_parse!(
+        sum:      md5sum_output >> char!(' ') >>
+        prefix:   alt!(char!(' ') | char!('*'))>>
+        filename: map_res!(rest, ::std::str::from_utf8) >>
+        (sum, filename)
+    ));
+
+fn read_md5sum_line(line: &str) -> Option<(&str, &str)> {
+    md5sum_line(line.as_bytes()).to_full_result().ok()
+}
+
+enum MD5Check {
+    MatchSuccess,
+    MatchFailed(String),
+    BadFormat,
+    ReadError(String, io::Error),
+}
+
+fn md5sum_check(line: &str) -> MD5Check {
+    use MD5Check::*;
+
+    match read_md5sum_line(&line) {
+        Some((expected, filename)) => {
+            match read_md5sum(filename) {
+                Ok(sum) => {
+                    let reached = format!("{:x}", sum);
+                    if expected != reached {
+                        MatchFailed(filename.to_string())
+                    } else {
+                        MatchSuccess
+                    }
+                }
+                Err(e) => {
+                    ReadError(filename.to_string(), e)
+                }
+            }
+        }
+        None => {
+            BadFormat
+        }
+    }
+}
+
+fn read_md5sum(filename: &str) -> io::Result<md5::Digest> {
+    read(filename, |r| md5sum(r))
+}
+
+fn read<F, T>(filename: &str, mut read_fn: F) -> io::Result<T>
+    where F: FnMut(&mut BufRead) -> io::Result<T>
+{
+    let stdin = io::stdin();
+
+    macro_rules! boxed_bufread {
+        ($e:expr) => {
+            Box::new($e) as Box<BufRead>
+        }
+    }
+
+    let mut reader = {
+        if filename == STDIN_NAME {
+            boxed_bufread!(stdin.lock())
+        } else {
+            let file = File::open(filename).map(BufReader::new)?;
+            boxed_bufread!(file)
+        }
+    };
+
+    read_fn(&mut reader)
+}
+
+fn md5sum<R: BufRead>(mut reader: R) -> io::Result<md5::Digest> {
     let mut c = md5::Context::new();
 
     loop {
         let nb_bytes_read = {
-            let bytes = reader.fill_buf()
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed reading buffer: {:?}", e);
-                    process::exit(1);
-                });
+            let bytes = reader.fill_buf()?;
 
             // EOF -> compute md5
             if bytes.is_empty() {
-                return c.compute();
+                return Ok(c.compute());
             }
 
             c.consume(bytes);
@@ -122,5 +258,36 @@ fn md5sum<R: BufRead>(mut reader: R) -> md5::Digest {
         };
 
         reader.consume(nb_bytes_read);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_should_validate_checksum_lines() {
+        let valid_lines = vec![
+            ("262d61a1b7a6df20a71b36563a78cd3b  Cargo.toml",  Some(("262d61a1b7a6df20a71b36563a78cd3b", "Cargo.toml"))),
+            ("9e1f74e2cd32f1da3bf795607ddd0366  src/main.rs", Some(("9e1f74e2cd32f1da3bf795607ddd0366", "src/main.rs"))),
+            ("9e1f74e2cd32f1da3bf795607ddd0366 *src/lib.rs",  Some(("9e1f74e2cd32f1da3bf795607ddd0366", "src/lib.rs"))),
+            ];
+
+        for (line, expected) in valid_lines {
+            assert_eq!(expected, read_md5sum_line(line));
+        }
+
+        let invalid_lines = vec![
+            " 9e1f74e2cd32f1da3bf795607ddd0366  src/main.rs",
+            " e1f74e2cd32f1da3bf795607ddd0366  src/main.rs",
+            "9e1f74e2cd32f1da3bf795607ddd03664 src/main.rs",
+            "9e1f74e2cd32f1da3bf795607ddd0366 -src/main.rs",
+            "9e1f74e2cd32f1da3bf795607ddd0366 src/main.rs",
+            "9e1f74e2cd32f1da3bf795607ddd0366 src/main.rs ",
+        ];
+
+        for line in invalid_lines {
+            assert_eq!(None, read_md5sum_line(line));
+        }
     }
 }
