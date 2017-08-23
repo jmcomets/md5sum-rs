@@ -193,22 +193,28 @@ fn md5sum_check(line: &str) -> MD5Check {
 
     match read_md5sum_line(&line) {
         Some((expected, filename)) => {
-            match read_md5sum(filename) {
-                Ok(sum) => {
-                    let reached = format!("{:x}", sum);
-                    if expected != reached {
-                        MatchFailed(filename.to_string())
-                    } else {
-                        MatchSuccess
-                    }
-                }
-                Err(e) => {
-                    ReadError(filename.to_string(), e)
-                }
-            }
+            md5sum_expect(filename, expected)
         }
         None => {
             BadFormat
+        }
+    }
+}
+
+fn md5sum_expect(filename: &str, expected: &str) -> MD5Check {
+    use MD5Check::*;
+
+    match read_md5sum(filename) {
+        Ok(sum) => {
+            let reached = format!("{:x}", sum);
+            if expected != reached {
+                MatchFailed(filename.to_string())
+            } else {
+                MatchSuccess
+            }
+        }
+        Err(e) => {
+            ReadError(filename.to_string(), e)
         }
     }
 }
