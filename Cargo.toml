@@ -1,9 +1,28 @@
 [package]
 authors = ["Jean-Marie Comets <jean.marie.comets@gmail.com>"]
+description = "A re-implementation of the GNU Coreutils md5sum program"
+documentation = "https://docs.rs/md5sum"
+homepage = "https://github.com/jmcomets/md5sum-rs"
+keywords = [
+    "coreutils",
+    "core-utils",
+    "core",
+    "utils",
+]
+license = "MIT"
 name = "md5sum"
+readme = "README.md"
+repository = "https://github.com/jmcomets/md5sum-rs"
 version = "0.1.0"
 
 [dependencies]
+clap = "2.26.2"
 md5 = "0.3.5"
-clap = "2.26.0"
-nom = "*"
+nom = "3.2.0"
+
+[dependencies.clippy]
+optional = true
+version = "0.0.165"
+
+[features]
+default = []
